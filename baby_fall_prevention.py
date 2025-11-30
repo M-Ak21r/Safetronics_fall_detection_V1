@@ -40,6 +40,9 @@ class DepthAnythingV2Wrapper:
     Depth Anything V2 architecture for high-quality monocular depth.
     """
 
+    # Model input size for Depth Anything V2 Large
+    MODEL_INPUT_SIZE = (518, 518)
+
     def __init__(self, device: str = "cuda"):
         """
         Initialize the Depth Anything V2 model.
@@ -50,6 +53,7 @@ class DepthAnythingV2Wrapper:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model = None
         self.transform = None
+        self._use_transformers = False
         self._load_model()
 
     def _load_model(self):
@@ -62,8 +66,8 @@ class DepthAnythingV2Wrapper:
                 pretrained=True,
                 trust_repo=True
             )
-        except Exception:
-            # Fallback: Try alternative loading method
+        except Exception as hub_error:
+            # Fallback: Try alternative loading method via transformers
             try:
                 from transformers import pipeline
 
@@ -74,16 +78,17 @@ class DepthAnythingV2Wrapper:
                 )
                 self._use_transformers = True
                 return
-            except ImportError:
-                pass
+            except ImportError as import_error:
+                print(f"Warning: transformers import failed: {import_error}")
+            except Exception as transformers_error:
+                print(f"Warning: transformers pipeline failed: {transformers_error}")
 
             # If both fail, create a placeholder that returns uniform depth
-            print("Warning: Could not load Depth Anything V2. Using fallback depth estimation.")
+            print(f"Warning: Could not load Depth Anything V2 (torch hub error: {hub_error}). "
+                  "Using fallback depth estimation.")
             self.model = None
-            self._use_transformers = False
             return
 
-        self._use_transformers = False
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -100,8 +105,8 @@ class DepthAnythingV2Wrapper:
         # Convert BGR to RGB
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        # Resize to model input size (518x518 for Depth Anything V2 Large)
-        resized = cv2.resize(rgb_image, (518, 518))
+        # Resize to model input size
+        resized = cv2.resize(rgb_image, self.MODEL_INPUT_SIZE)
 
         # Normalize to [0, 1] and then apply ImageNet normalization
         normalized = resized.astype(np.float32) / 255.0
@@ -129,7 +134,7 @@ class DepthAnythingV2Wrapper:
             # Fallback: Return uniform depth
             return np.ones((original_h, original_w), dtype=np.float32) * 0.5
 
-        if hasattr(self, '_use_transformers') and self._use_transformers:
+        if self._use_transformers:
             # Use transformers pipeline
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             from PIL import Image
@@ -308,8 +313,8 @@ class BabyFallPreventionSystem:
     BABY_MIN_ASPECT_RATIO = 0.3
     BABY_MAX_ASPECT_RATIO = 1.5
 
-    # Adults standing typically have higher aspect ratios
-    ADULT_MIN_ASPECT_RATIO = 1.5
+    # Adults standing typically have higher aspect ratios (exclusive threshold)
+    ADULT_MIN_ASPECT_RATIO = 1.51
 
     def __init__(
         self,
@@ -472,11 +477,21 @@ class BabyFallPreventionSystem:
         # Blend depth map with original frame (30% depth, 70% original)
         blended = cv2.addWeighted(frame, 0.7, depth_colored, 0.3, 0)
 
-        # Draw Virtual Depth Wall indicator (horizontal line at threshold depth)
         h, w = frame.shape[:2]
-        # Find pixels at threshold depth
+
+        # Draw Virtual Depth Wall indicator line
+        # Calculate normalized threshold for visualization
         threshold_normalized = 1.0 - (self.z_threshold - self.min_depth) / (self.max_depth - self.min_depth)
         threshold_normalized = max(0, min(1, threshold_normalized))
+
+        # Draw a horizontal indicator showing depth threshold zone
+        depth_indicator_y = int(h * (1 - threshold_normalized * 0.5))
+        cv2.line(blended, (0, depth_indicator_y), (w, depth_indicator_y), (0, 255, 255), 2)
+        cv2.putText(
+            blended, f"Depth Wall Zone (Z={self.z_threshold}m)",
+            (10, depth_indicator_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1
+        )
 
         # Draw detection boxes and information
         for result in results:
@@ -514,9 +529,13 @@ class BabyFallPreventionSystem:
         # Draw alarm banner if triggered
         if alarm_triggered:
             cv2.rectangle(blended, (0, 0), (w, 60), (0, 0, 255), -1)
+            alarm_text = "!!! ALARM - BABY CROSSING BED EDGE !!!"
+            # Calculate text size for proper centering
+            text_size = cv2.getTextSize(alarm_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+            text_x = max(10, (w - text_size[0]) // 2)
             cv2.putText(
-                blended, "!!! ALARM - BABY CROSSING BED EDGE !!!",
-                (w // 2 - 250, 40),
+                blended, alarm_text,
+                (text_x, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2
             )
 
@@ -586,10 +605,15 @@ class BabyFallPreventionSystem:
             if key == ord('q'):
                 break
             elif key == ord('c'):
-                # Calibrate depth wall at current frame center
+                # Calibrate depth wall - user should position camera so bed edge
+                # is at center of frame before pressing 'c'
                 depth_map = self.depth_estimator.estimate_depth(frame)
-                self.z_threshold = self.calibrate_depth_wall(depth_map, height // 2)
-                print(f"Calibrated depth wall to {self.z_threshold:.2f}m")
+                # Use frame center as calibration point
+                # Note: For production, consider implementing click-to-calibrate
+                calibration_y = height // 2
+                self.z_threshold = self.calibrate_depth_wall(depth_map, calibration_y)
+                print(f"Calibrated depth wall to {self.z_threshold:.2f}m "
+                      f"(using y={calibration_y} as bed edge reference)")
 
         # Cleanup
         cap.release()
